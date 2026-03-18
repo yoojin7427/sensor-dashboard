@@ -243,7 +243,7 @@ if st.session_state.final_df is not None:
     vis_df = final_df.copy().sort_values('time_sec').reset_index(drop=True)
     
     # 데이터 정제 (NaN 제거)
-    vis_df = vis_df.fillna(method='bfill', limit=1).fillna(method='ffill', limit=1)
+    vis_df = vis_df.bfill(limit=1).ffill(limit=1)
     
     feature_plot_cols = {
         'BVP_Mean': ('BVP_BVP_mean', '#ef553b'),
@@ -306,7 +306,7 @@ if st.session_state.final_df is not None:
         # 트레이스 추가 (WebGL 사용으로 10배 이상 빠름)
         for i, (title, (col_name, color)) in enumerate(selected_cols.items(), start=1):
             if col_name in vis_df.columns:
-                y_data = vis_df[col_name].fillna(method='bfill', limit=1).fillna(method='ffill', limit=1).values
+                y_data = vis_df[col_name].bfill(limit=1).ffill(limit=1).values
                 
                 fig.add_trace(
                     go.Scattergl(  # ← 핵심: go.Scatter 대신 go.Scattergl (WebGL)
