@@ -1,2 +1,19 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sensor-dashboard"
+version = "1.0.0"
+description = "Sensor Data Interactive Visualization Dashboard"
+requires-python = ">=3.9,<3.14"
+dependencies = [
+    "streamlit==1.32.2",
+    "pandas==2.2.1",
+    "numpy==1.26.4",
+    "plotly==5.18.0",
+    "scipy==1.12.0",
+]
+
 [tool.streamlit]
 pythonVersion = "3.9"
