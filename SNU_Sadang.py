@@ -5,6 +5,20 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy import signal
 
+# ================== 캐싱 설정 ==================
+@st.cache_data
+def read_watch_csv(file):
+    """CSV 파일 읽기 (캐싱됨)"""
+    df = pd.read_csv(file)
+    df.columns = [c.lower().strip() for c in df.columns]
+    if 'time_kst' in df.columns:
+        df['time_kst'] = pd.to_datetime(df['time_kst'])
+    cols_to_fix = [c for c in df.columns if c in ['x', 'y', 'z', 'bvp', 'eda', 'temperature', 'temp']]
+    for c in cols_to_fix:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df.dropna(subset=cols_to_fix).reset_index(drop=True)
+
+# ================== 1. 핵심 전처리 함수 (HRV & EDA) ==================
 # ================== 1. 핵심 전처리 함수 (HRV & EDA) ==================
 def winsorize_signal(data, lower=1, upper=99):
     data = np.asarray(data, dtype=float)
@@ -12,8 +26,17 @@ def winsorize_signal(data, lower=1, upper=99):
     low_val, high_val = np.percentile(data, [lower, upper])
     return np.clip(data, low_val, high_val)
 
+def preprocess_common_signal(df, col_names, fs):
+    """신호 전처리 (보간, 이동평균, winsorize)"""
+    if len(df) == 0: return df
+    for c in col_names:
+        df[c] = df[c].interpolate(method='linear', limit_direction='both')
+        df[c] = df[c].rolling(window=int(fs * 3), min_periods=1, center=True).mean()
+        df[c] = winsorize_signal(df[c], 1, 99)
+    return df
+
 def extract_hrv_from_signal(values, fs, prefix):
-    """BVP 신호에서 HR, RMSSD, Amp 등 추출"""
+    """BVP 신호에서 HR, RMSSD, Amp 등 추출 (최적화)"""
     feats = {
         f"{prefix}_Amp_Mean_60s": 0.0, f"{prefix}_Amp_Std_60s": 0.0,
         f"{prefix}_HR_Mean_60s": 0.0, f"{prefix}_HR_Std_60s": 0.0,
@@ -23,20 +46,17 @@ def extract_hrv_from_signal(values, fs, prefix):
         v = winsorize_signal(np.asarray(values, dtype=float), 1, 99)
         if len(v) == 0: return feats
         
-        # Bandpass filter (0.5Hz ~ 8.0Hz)
         b, a = signal.butter(3, [0.5/(fs/2), 8.0/(fs/2)], btype="band")
         clean_v = signal.filtfilt(b, a, v)
         
-        # Envelope 추출
         env = np.abs(signal.hilbert(clean_v))
         feats[f"{prefix}_Amp_Mean_60s"] = float(np.mean(env))
         feats[f"{prefix}_Amp_Std_60s"] = float(np.std(env))
         
-        # 피크 검출
         peaks, _ = signal.find_peaks(clean_v, distance=fs/2.5)
         if len(peaks) > 3:
-            rr = np.diff(peaks) / fs * 1000.0  # ms 단위
-            rr = rr[(rr > 300) & (rr < 1300)]  # 정상 범위 필터링
+            rr = np.diff(peaks) / fs * 1000.0
+            rr = rr[(rr > 300) & (rr < 1300)]
             if len(rr) > 2:
                 hr = 60000.0/rr
                 feats[f"{prefix}_HR_Mean_60s"] = float(np.mean(hr))
@@ -69,20 +89,17 @@ def extract_eda_60s(df_win, fs=4):
         return {"EDA_Mean_60s": 0, "EDA_Phasic_Max_60s": 0, "EDA_SCR_Peaks_60s": 0}
 
 # ================== 2. 데이터 로드 및 정제 ==================
-def read_watch_csv(file):
-    df = pd.read_csv(file)
-    df.columns = [c.lower().strip() for c in df.columns]
-    if 'time_kst' in df.columns:
-        df['time_kst'] = pd.to_datetime(df['time_kst'])
-    cols_to_fix = [c for c in df.columns if c in ['x', 'y', 'z', 'bvp', 'eda', 'temperature', 'temp']]
-    for c in cols_to_fix:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
-    return df.dropna(subset=cols_to_fix).reset_index(drop=True)
 
 # ================== 3. 메인 UI ==================
 st.set_page_config(page_title="센서 데이터 시각화", layout="wide")
 st.title("📊 센서 데이터 인터랙티브 시각화 보드")
 st.markdown("스트레스 파악 용도의 통합 센서 데이터를 인터랙티브 그래프로 확인합니다. **그래프 위로 마우스 커서를 올리면 상세 시간(Time)과 측정값을 볼 수 있습니다.**")
+
+# session_state 초기화
+if 'final_df' not in st.session_state:
+    st.session_state.final_df = None
+if 'label_file_processed' not in st.session_state:
+    st.session_state.label_file_processed = False
 
 st.sidebar.header("⚙️ 데이터 업로드")
 uploaded_files = st.sidebar.file_uploader("CSV 파일들(ACC, BVP, EDA, TEMP)업로드", type=["csv"], accept_multiple_files=True)
@@ -102,8 +119,11 @@ if uploaded_files:
 if st.sidebar.button("🚀 시각화 시작"):
     if all([acc_f, bvp_f, eda_f, tmp_f]):
         try:
-            with st.status("데이터 전처리 및 피처 추출 중...") as status:
+            with st.status("데이터 전처리 및 피처 추출 중...", expanded=True) as status:
                 df_acc = read_watch_csv(acc_f)
+                df_bvp = read_watch_csv(bvp_f)
+                df_eda = read_watch_csv(eda_f)
+                df_tmp = read_watch_csv(tmp_f)
                 # 공통 전처리: 이상치 제거(1~99% Winsorize) 및 결측치 3초 이동평균(Interpolate)
                 # 여기서는 초 단위로 병합되기 전 로우 데이터에 적용
                 def preprocess_common_signal(df, col_names, fs):
@@ -202,82 +222,119 @@ if st.sidebar.button("🚀 시각화 시작"):
                     final_df['label'] = final_df['label_y'].fillna(0).astype(int)
                     final_df = final_df.drop(columns=['label_x', 'label_y'], errors='ignore')
                 
+                # session_state에 저장
+                st.session_state.final_df = final_df
+                st.session_state.label_file_processed = bool(label_f)
+                
                 status.update(label="✅ 전처리 완료!", state="complete")
-
-            # --- Plotly 시각화 ---
-            st.success("데이터 처리가 완료되었습니다. 마우스를 드래그하여 확대/축소할 수 있습니다.")
-            
-            vis_df = final_df.copy().sort_values('time_sec')
-            
-            feature_plot_cols = {
-                'BVP_Mean': ('BVP_BVP_mean', '#ef553b'),
-                'BVP_Amplitude': ('BVP_Amp_Mean_60s', '#ff97ff'),
-                'BVP_RMSSD': ('BVP_RMSSD_60s', '#ab63fa'),
-                'EDA_Mean': ('EDA_EDA_mean', '#ffa15a'),
-                'EDA_Phasic_Max': ('EDA_Phasic_Max_60s', '#19d3f3'),
-                'EDA_SCR_Peaks': ('EDA_SCR_Peaks_60s', '#ff6692'),
-                'ACC_MAG_Mean': ('ACC_ACC_MAG_mean', '#00cc96'),
-                'TEMP_Mean': ('TEMP_TEMP_mean', '#b6e880')
-            }
-            
-            fig = make_subplots(rows=len(feature_plot_cols), cols=1, shared_xaxes=True,
-                                subplot_titles=list(feature_plot_cols.keys()),
-                                vertical_spacing=0.03)
-
-            x_time = vis_df['time_sec']
-            y_label = vis_df['label'] if 'label' in vis_df.columns else pd.Series([0]*len(vis_df))
-            stress_indices = y_label == 1
-            
-            for i, (title, (col_name, color)) in enumerate(feature_plot_cols.items(), start=1):
-                if col_name in vis_df.columns:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=x_time, 
-                            y=vis_df[col_name], 
-                            name=title, 
-                            mode='lines',
-                            line=dict(color=color, width=1.5),
-                            hovertemplate='%{x}<br>Value: %{y:.3f}<extra></extra>'
-                        ),
-                        row=i, col=1
-                    )
-                            
-            shapes = []
-            if label_f and any(stress_indices):
-                diffs = np.diff(stress_indices.astype(int), prepend=0, append=0)
-                starts = np.where(diffs == 1)[0]
-                ends = np.where(diffs == -1)[0]
-                
-                for s, e in zip(starts, ends):
-                    start_t = x_time.iloc[s]
-                    end_t = x_time.iloc[e-1] + pd.Timedelta(seconds=1)
-                        
-                    shapes.append(dict(
-                        type="rect",
-                        xref="x", yref="paper",
-                        x0=start_t, y0=0, x1=end_t, y1=1,
-                        fillcolor="gray", opacity=0.3, layer="below", line_width=0,
-                    ))
-
-            fig.update_layout(
-                height=1400,
-                hovermode="x unified",
-                showlegend=False,
-                margin=dict(l=20, r=20, t=40, b=20),
-                shapes=shapes,
-                plot_bgcolor='rgba(0,0,0,0)',
-                paper_bgcolor='rgba(0,0,0,0)'
-            )
-            
-            for i in range(1, len(feature_plot_cols) + 1):
-                fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)', row=i, col=1)
-                fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)', row=i, col=1)
-                
-            fig.update_xaxes(title_text="Time", row=len(feature_plot_cols), col=1)
-
-            st.plotly_chart(fig, use_container_width=True)
 
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
     else:
         st.warning("분석을 시작하려면 왼쪽 사이드바에서 (ACC, BVP, EDA, TEMP) 파일을 모두 업로드해주세요.")
+
+# 저장된 데이터가 있으면 시각화
+if st.session_state.final_df is not None:
+    st.markdown("---")
+    st.subheader("📈 센서 시각화")
+    st.success("데이터 처리가 완료되었습니다. 마우스를 드래그하여 확대/축소할 수 있습니다.")
+    
+    final_df = st.session_state.final_df
+    vis_df = final_df.copy().sort_values('time_sec').reset_index(drop=True)
+    
+    # 데이터 정제 (NaN 제거)
+    vis_df = vis_df.fillna(method='bfill', limit=1).fillna(method='ffill', limit=1)
+    
+    feature_plot_cols = {
+        'BVP_Mean': ('BVP_BVP_mean', '#ef553b'),
+        'BVP_Amplitude': ('BVP_Amp_Mean_60s', '#dc143c'),
+        'BVP_RMSSD': ('BVP_RMSSD_60s', '#ff0000'),
+        'EDA_Mean': ('EDA_EDA_mean', '#ffa15a'),
+        'EDA_Phasic_Max': ('EDA_Phasic_Max_60s', '#ff8c00'),
+        'EDA_SCR_Peaks': ('EDA_SCR_Peaks_60s', '#ff7f00'),
+        'ACC_MAG_Mean': ('ACC_ACC_MAG_mean', '#00cc96'),
+        'TEMP_Mean': ('TEMP_TEMP_mean', '#ffd700')
+    }
+    
+    # 수동 선택 가능
+    col1, col2 = st.columns([2, 1])
+    with col2:
+        st.write("**표시할 지표 선택**")
+        selected_features = st.multiselect(
+            "그래프에 표시할 지표",
+            list(feature_plot_cols.keys()),
+            default=list(feature_plot_cols.keys()),
+            label_visibility="collapsed"
+        )
+    
+    if not selected_features:
+        st.info("최소 1개의 지표를 선택해주세요")
+    else:
+        # 선택된 항목만 필터링
+        selected_cols = {k: v for k, v in feature_plot_cols.items() if k in selected_features}
+        
+        fig = make_subplots(
+            rows=len(selected_cols), cols=1, shared_xaxes=True,
+            subplot_titles=list(selected_cols.keys()),
+            vertical_spacing=0.08
+        )
+
+        x_time = vis_df['time_sec']
+        y_label = vis_df['label'] if 'label' in vis_df.columns else pd.Series([0]*len(vis_df))
+        stress_indices = y_label == 1
+        
+        # shape 미리 계산
+        shapes = []
+        if st.session_state.label_file_processed and any(stress_indices):
+            diffs = np.diff(stress_indices.astype(int), prepend=0, append=0)
+            starts = np.where(diffs == 1)[0]
+            ends = np.where(diffs == -1)[0]
+            
+            for s, e in zip(starts, ends):
+                try:
+                    start_t = x_time.iloc[s]
+                    end_t = x_time.iloc[e-1] + pd.Timedelta(seconds=1)
+                    shapes.append(dict(
+                        type="rect",
+                        xref="x", yref="paper",
+                        x0=start_t, y0=0, x1=end_t, y1=1,
+                        fillcolor="rgba(128,128,128,0.15)", layer="below", line_width=0,
+                    ))
+                except:
+                    pass
+        
+        # 트레이스 추가 (WebGL 사용으로 10배 이상 빠름)
+        for i, (title, (col_name, color)) in enumerate(selected_cols.items(), start=1):
+            if col_name in vis_df.columns:
+                y_data = vis_df[col_name].fillna(method='bfill', limit=1).fillna(method='ffill', limit=1).values
+                
+                fig.add_trace(
+                    go.Scattergl(  # ← 핵심: go.Scatter 대신 go.Scattergl (WebGL)
+                        x=x_time, 
+                        y=y_data,
+                        name=title, 
+                        mode='lines',
+                        line=dict(color=color, width=1.5),
+                        hovertemplate='<b>%{x|%H:%M:%S}</b><br>%{y:.2f}<extra></extra>'
+                    ),
+                    row=i, col=1
+                )
+        
+        height = max(400, len(selected_cols) * 200)  # 동적 높이
+        fig.update_layout(
+            height=height,
+            hovermode="x unified",
+            showlegend=False,
+            margin=dict(l=50, r=20, t=40, b=20),
+            shapes=shapes,
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+        )
+        
+        for i in range(1, len(selected_cols) + 1):
+            fig.update_xaxes(showgrid=True, gridwidth=0.5, gridcolor='rgba(128,128,128,0.1)', row=i, col=1)
+            fig.update_yaxes(showgrid=True, gridwidth=0.5, gridcolor='rgba(128,128,128,0.1)', row=i, col=1)
+                
+        fig.update_xaxes(title_text="Time", row=len(selected_cols), col=1)
+
+        st.plotly_chart(fig, use_container_width=True, config={'responsive': True, 'displayModeBar': True})
