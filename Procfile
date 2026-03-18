@@ -1,0 +1,1 @@
+web: streamlit run SNU_Sadang.py --server.port $PORT --server.headless true --server.runOnSave false
