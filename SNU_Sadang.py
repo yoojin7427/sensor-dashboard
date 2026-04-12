@@ -30,7 +30,7 @@ def preprocess_common_signal(df, col_names, fs):
     """신호 전처리 (보간, 이동평균, winsorize)"""
     if len(df) == 0: return df
     for c in col_names:
-        df[c] = df[c].interpolate(method='linear', limit_direction='both')
+        df[c] = df[c].interpolate('linear', limit_direction='both')
         df[c] = df[c].rolling(window=int(fs * 3), min_periods=1, center=True).mean()
         df[c] = winsorize_signal(df[c], 1, 99)
     return df
@@ -208,19 +208,32 @@ if st.sidebar.button("🚀 시각화 시작"):
 
                 if label_f:
                     df_label = pd.read_csv(label_f) if label_f.name.endswith('csv') else pd.read_excel(label_f)
-                    df_label['time_sec'] = pd.to_datetime(df_label['실제 날짜'].astype(str) + ' ' + df_label['실제 시각'].astype(str)).dt.floor('1s')
                     
-                    start_time = df_label['time_sec'].min()
-                    end_time = df_label['time_sec'].max()
+                    # 컬럼명 정규화 (소문자, 공백 제거)
+                    df_label.columns = [c.lower().strip() for c in df_label.columns]
                     
-                    final_df = final_df[(final_df['time_sec'] >= start_time) & (final_df['time_sec'] <= end_time)]
+                    # 날짜/시간 컬럼 자동 감지
+                    date_col = next((c for c in df_label.columns if '날짜' in c or 'date' in c), None)
+                    time_col = next((c for c in df_label.columns if '시각' in c or 'time' in c), None)
                     
-                    stress_times = df_label[['time_sec']].drop_duplicates()
-                    stress_times['label'] = 1
+                    if date_col and time_col:
+                        df_label['time_sec'] = pd.to_datetime(df_label[date_col].astype(str) + ' ' + df_label[time_col].astype(str)).dt.floor('1s')
+                    else:
+                        st.error(f"❌ 레이블 파일의 컬럼을 찾을 수 없습니다.\n현재 컬럼: {list(df_label.columns)}")
+                        df_label = None
                     
-                    final_df = final_df.merge(stress_times, on='time_sec', how='left')
-                    final_df['label'] = final_df['label_y'].fillna(0).astype(int)
-                    final_df = final_df.drop(columns=['label_x', 'label_y'], errors='ignore')
+                    if df_label is not None:
+                        start_time = df_label['time_sec'].min()
+                        end_time = df_label['time_sec'].max()
+                        
+                        final_df = final_df[(final_df['time_sec'] >= start_time) & (final_df['time_sec'] <= end_time)]
+                        
+                        stress_times = df_label[['time_sec']].drop_duplicates()
+                        stress_times['label'] = 1
+                        
+                        final_df = final_df.merge(stress_times, on='time_sec', how='left')
+                        final_df['label'] = final_df['label_y'].fillna(0).astype(int)
+                        final_df = final_df.drop(columns=['label_x', 'label_y'], errors='ignore')
                 
                 # session_state에 저장
                 st.session_state.final_df = final_df
